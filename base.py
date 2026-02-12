@@ -50,7 +50,7 @@ class STWrapper:
         )
 
 # 1) Load BEIR dataset
-dataset = "scifact"  # or "nfcorpus"
+dataset = "nfcorpus"  # or "nfcorpus"
 url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
 data_path = util.download_and_unzip(url, "datasets")
 corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
@@ -59,7 +59,7 @@ corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="te
 model = STWrapper(MODEL_NAME, batch_size=64, normalize=True)
 dres = DRES(model, batch_size=64)
 
-retriever = EvaluateRetrieval(dres, score_function="cos_sim")  # if normalized, cos_sim is natural
+retriever = EvaluateRetrieval(dres, score_function="dot") 
 results = retriever.retrieve(corpus, queries)
 
 # 3) Evaluate
