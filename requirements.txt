@@ -1,3 +1,7 @@
 beir
 sentence-transformers
 numpy
+torch
+transformers
+accelerate
+scipy

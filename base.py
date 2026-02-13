@@ -1,10 +1,15 @@
+import argparse
+import json
 import numpy as np
-from beir import util
+from pathlib import Path
+
 from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 
 from sentence_transformers import SentenceTransformer
+
+K_VALUES = [1, 3, 5, 10, 100]
 
 MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query"
@@ -49,20 +54,97 @@ class STWrapper:
             show_progress_bar=True,
         )
 
-# 1) Load BEIR dataset
-dataset = "nfcorpus"  # or "nfcorpus"
-url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-data_path = util.download_and_unzip(url, "datasets")
-corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+def load_query_k_target(data_path: Path) -> dict:
+    """Load query_id -> k_target from mixture queries.jsonl (mix_* lines only)."""
+    out = {}
+    path = data_path / "queries.jsonl"
+    if not path.exists():
+        return out
+    with open(path) as f:
+        for line in f:
+            obj = json.loads(line)
+            qid = obj.get("_id", "")
+            if qid.startswith("mix_"):
+                out[qid] = obj.get("k_target", 1)
+    return out
 
-# 2) Build retriever
-model = STWrapper(MODEL_NAME, batch_size=64, normalize=True)
-dres = DRES(model, batch_size=64)
 
-retriever = EvaluateRetrieval(dres, score_function="dot") 
-results = retriever.retrieve(corpus, queries)
+def run_test(data_path: Path, use_hard: bool = False, by_k: bool = False):
+    """Run evaluation on test set (or hard subset); print nDCG@10 and Recall@100."""
+    if use_hard:
+        hard_qrels_path = data_path / "qrels" / "test_hard.tsv"
+        if not hard_qrels_path.exists():
+            raise FileNotFoundError(f"Hard test set not found: {hard_qrels_path}. Run scripts/generate_cars_dataset.py first.")
+        loader = GenericDataLoader(
+            data_folder=str(data_path),
+            qrels_file=str(hard_qrels_path),
+        )
+        corpus, queries, qrels = loader.load_custom()
+        print("Evaluating on hard set (cross-domain OR + multi-attr single)...")
+    else:
+        corpus, queries, qrels = GenericDataLoader(data_folder=str(data_path)).load(split="test")
+    model = STWrapper(MODEL_NAME, batch_size=64, normalize=True)
+    dres = DRES(model, batch_size=64)
+    retriever = EvaluateRetrieval(dres, score_function="cos_sim")
+    results = retriever.retrieve(corpus, queries)
+    if by_k:
+        query_to_k = load_query_k_target(data_path)
+        if query_to_k:
+            for k_val in [1, 2, 3]:
+                qids_k = [qid for qid in queries if query_to_k.get(qid) == k_val]
+                if not qids_k:
+                    continue
+                qrels_k = {qid: qrels[qid] for qid in qids_k if qid in qrels}
+                results_k = {qid: results[qid] for qid in qids_k if qid in results}
+                if not qrels_k:
+                    continue
+                ndcg_k, _map_k, recall_k, _ = retriever.evaluate(qrels_k, results_k, K_VALUES)
+                print(f"  K={k_val} (n={len(qids_k)}): nDCG@10={ndcg_k['NDCG@10']:.4f}, Recall@100={recall_k['Recall@100']:.4f}")
+        else:
+            print("--by-k: no mix_* queries with k_target in queries.jsonl; skipping breakdown.")
+    ndcg, _map, recall, precision = retriever.evaluate(qrels, results, K_VALUES)
+    print("nDCG@10:", ndcg["NDCG@10"])
+    print("Recall@100:", recall["Recall@100"])
 
-# 3) Evaluate
-ndcg, _map, recall, precision = retriever.evaluate(qrels, results, retriever.k_values)
-print("nDCG@10:", ndcg["NDCG@10"])
-print("Recall@100:", recall["Recall@100"])
+
+def run_query(data_path: Path, query: str, top_k: int = 10):
+    """Run a single query and print top-k results. Uses direct encode + cos_sim to avoid BEIR bug with 1 query."""
+    corpus, _, _ = GenericDataLoader(data_folder=str(data_path)).load(split="test")
+    model = STWrapper(MODEL_NAME, batch_size=64, normalize=True)
+    corpus_ids = list(corpus.keys())
+    corpus_list = [corpus[doc_id] for doc_id in corpus_ids]
+    query_emb = model.encode_queries([query], show_progress_bar=False)
+    corpus_emb = model.encode_corpus(corpus_list, show_progress_bar=True)
+    # Normalized embeddings -> cosine sim = dot product
+    scores = np.dot(query_emb, corpus_emb.T).flatten()
+    top_indices = np.argsort(scores)[::-1][:top_k]
+    print(f"Query: {query}\nTop-{top_k} results:\n")
+    for rank, idx in enumerate(top_indices, 1):
+        doc_id = corpus_ids[idx]
+        doc = corpus[doc_id]
+        text = doc.get("text", "")
+        title = doc.get("title", "")
+        if title:
+            text = f"{title} — {text}"
+        print(f"  {rank}. [{doc_id}] (score={scores[idx]:.4f}) {text}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run retrieval: --test for eval, --query for single query.")
+    parser.add_argument("--test", action="store_true", help="Run evaluation on test set")
+    parser.add_argument("--hard", action="store_true", help="Use hard test set (cross-domain OR + multi-attr single); use with --test")
+    parser.add_argument("--query", type=str, default=None, metavar="Q", help='Run a single query and print top results (e.g. --query "fast car or 3.5 room apartment")')
+    parser.add_argument("--top-k", type=int, default=10, help="Number of results to show for --query (default: 10)")
+    parser.add_argument("--data", type=str, default=None, help="Path to dataset folder (default: datasets/cars). Use datasets/cars_mixtures for mixture test set.")
+    parser.add_argument("--by-k", action="store_true", help="Report metrics by k_target (K=1,2,3). Use with --test and mixture data.")
+    args = parser.parse_args()
+
+    data_path = Path(args.data) if args.data else Path(__file__).resolve().parent / "datasets" / "cars"
+
+    if args.query is not None:
+        run_query(data_path, args.query, top_k=args.top_k)
+    if args.test:
+        run_test(data_path, use_hard=args.hard, by_k=args.by_k)
+    if args.query is None and not args.test:
+        parser.print_help()
+        print("\nUse --test to run evaluation or --query \"...\" to run a single query.")
